@@ -3,7 +3,7 @@ Provide executor pool for simultaneous processing task/message without  the prob
 
 ## Synchronization
 
-### Locker:
+### Locker
 Locks are implemented using 2 separate counter, a ticket counter and a access counter. Each thread trying to acquire lock request a ticket by incrementing the ticket counter. The lock is granted to the thread if and only if the value of the ticket counter equals to the value of access counter. On release of the lock, the thread increments the access counter then make the next waiting thread grant the lock access.
 
 ### Barrier
@@ -35,3 +35,33 @@ Semaphores are often used to guard resources with limited capacity, for example,
 This is one of the simplest mechanisms for communication between threads: one thread signals an event and other threads wait for it.
 
 An event object manages an internal flag that can be set to true with the set() method and reset to false with the clear() method. The wait() method blocks until the flag is true.
+
+### Condition Objects
+A condition variable is always associated with some kind of lock; this can be passed in or one will be created by default. Passing one in is useful when several condition variables must share the same lock. The lock is part of the condition object: you don’t have to track it separately.
+
+A condition variable obeys the context management protocol: using the with statement acquires the associated lock for the duration of the enclosed block. The acquire() and release() methods also call the corresponding methods of the associated lock.
+
+Other methods must be called with the associated lock held. The wait() method releases the lock, and then blocks until another thread awakens it by calling notify() or notify_all(). Once awakened, wait() re-acquires the lock and returns. It is also possible to specify a timeout.
+
+The notify() method wakes up one of the threads waiting for the condition variable, if any are waiting. The notify_all() method wakes up all threads waiting for the condition variable.
+
+Note: the notify() and notify_all() methods don’t release the lock; this means that the thread or threads awakened will not return from their wait() call immediately, but only when the thread that called notify() or notify_all() finally relinquishes ownership of the lock.
+```python
+# Consume one item
+with cv:
+    while not an_item_is_available():
+        cv.wait()
+    get_an_available_item()
+
+# Produce one item
+with cv:
+    make_an_item_available()
+    cv.notify()
+```
+The while loop checking for the application’s condition is necessary because wait() can return after an arbitrary long time, and the condition which prompted the notify() call may no longer hold true. This is inherent to multi-threaded programming. The wait_for() method can be used to automate the condition checking, and eases the computation of timeouts:
+```
+# Consume an item
+with cv:
+    cv.wait_for(an_item_is_available)
+    get_an_available_item()
+```
