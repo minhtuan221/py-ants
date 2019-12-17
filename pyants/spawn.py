@@ -1,43 +1,28 @@
-import asyncio
-import functools
-import os
-import threading
-from concurrent.futures import Future, ThreadPoolExecutor
-
-# Alternatively, you can create an instance of the loop manually, using:
-
-import uvloop
-# loop = uvloop.new_event_loop()
-# asyncio.set_event_loop(loop)
+import multiprocessing
 import queue
+import threading
+# Alternatively, you can create an instance of the loop manually, using: uvloop
 import time
 from collections import deque
-import queue
-import threading
-import random
-import multiprocessing
+from collections.abc import Iterable
+from typing import List, Callable
 
 
 class SyncThread(threading.Thread):
     """Threaded Sync reader, read data from queue"""
 
-    def __init__(self, in_queue, out_queue=None, name=None, watching: deque=None):
+    def __init__(self, in_queue, out_queue=None, name=None, watching: deque = None):
         """Threaded Sync reader, read data from queue
-
         Arguments:
             queue {[type]} -- queue or deque
-
         Keyword Arguments:
             out_queue {[type]} -- queue receive result (default: {None})
         """
 
         threading.Thread.__init__(self, name=name)
-        self.in_queue = in_queue
-        self.out_queue = out_queue
+        self.in_queue: queue.Queue = in_queue
+        self.out_queue: queue.Queue = out_queue
         self.watching = watching
-
-    def main_process(self, f, *args, **kwargs):
-        return f(*args, **kwargs)
 
     def run(self):
         while True:
@@ -45,23 +30,26 @@ class SyncThread(threading.Thread):
             f, args, kwargs = self.in_queue.get()
 
             # Grabs item and put to input_function
-            result = self.main_process(f, *args, *kwargs), None
-            result = result[:-1]
+            result = f(*args, **kwargs)
 
-            if self.out_queue is not None:
-                self.out_queue.put(*result)
+            if self.out_queue and result:
+                if isinstance(result, Iterable):
+                    self.out_queue.put(*result)
+                else:
+                    self.out_queue.put(*[result])
 
-            if self.watching is not None:
+            if self.watching and len(self.watching) > 0:
                 self.watching.popleft()
                 # print('Watching list is:', self.watching)
 
             # Signals to queue job is done
             self.in_queue.task_done()
+            # print('Thread complete task', self.getName())
 
 
 class AsyncProcess(multiprocessing.Process):
 
-    def __init__(self, in_queue, out_queue, name=None, watching: deque=None):
+    def __init__(self, in_queue, out_queue, name=None, watching: deque = None):
         multiprocessing.Process.__init__(self, name=name)
         self.in_queue = in_queue
         self.out_queue = out_queue
@@ -71,22 +59,21 @@ class AsyncProcess(multiprocessing.Process):
     def stop(self):
         self.stop_event.set()
 
-    def main_process(self, f, *args, **kwargs):
-        return f(*args, **kwargs)
-
     def run(self):
         while not self.stop_event.is_set():
-            # Grabs host from queue
+            # Grabs item from queue
             f, args, kwargs = self.in_queue.get()
 
             # Grabs item and put to input_function
-            result = self.main_process(f, *args, *kwargs), None
-            result = result[:-1]
+            result = f(*args, **kwargs)
 
-            if self.out_queue is not None:
-                self.out_queue.put(*result)
+            if self.out_queue and result:
+                if isinstance(result, Iterable):
+                    self.out_queue.put(*result)
+                else:
+                    self.out_queue.put(*[result])
 
-            if self.watching is not None:
+            if self.watching and len(self.watching) > 0:
                 self.watching.popleft()
 
             # Signals to queue job is done
@@ -98,13 +85,16 @@ class AsyncProcess(multiprocessing.Process):
 
 class DistributedThreads(object):
 
-    def __init__(self, out_queue=None, max_workers=4, max_watching=100, worker=None, maxsize=0, delay=1):
+    def __init__(self, out_queue=None, max_workers=4, max_watching=100, worker=None, maxsize=0, delay=0.005):
         self.out_queue = out_queue
         self.max_workers = max_workers
         self.max_watching = max_watching
         self.current_id = 0
         self.max_qsize = maxsize
         self.delay = delay
+        self.queue_list = []
+        self.watching_list = []
+        self.worker_list = []
         if worker is None:
             self.init_worker()
         else:
@@ -112,11 +102,10 @@ class DistributedThreads(object):
 
     def init_worker(self, worker=SyncThread):
         # create list of queue
-        self.queue_list = [queue.Queue(maxsize=self.max_qsize)
-                           for i in range(self.max_workers)]
+        self.queue_list = [queue.Queue(maxsize=self.max_qsize) for _ in range(self.max_workers)]
 
         # create list of watching queue
-        self.watching_list = [deque() for i in range(self.max_workers)]
+        self.watching_list = [deque() for _ in range(self.max_workers)]
 
         # create list of threads:
         self.worker_list = []
@@ -134,7 +123,7 @@ class DistributedThreads(object):
             time.sleep(self.delay)
 
     def next_worker(self, last_id):
-        return (last_id+1) % self.max_workers
+        return (last_id + 1) % self.max_workers
 
     def check_next_queue(self, current_queue_size, last_id):
         next_id = self.next_worker(last_id)
@@ -148,7 +137,7 @@ class DistributedThreads(object):
         return self.check_next_queue(current_queue_size, self.current_id)
         # return (self.current_id+1) % self.max_workers
 
-    def submit(self, f, *args, **kwargs):
+    def submit(self, f: Callable, *args, **kwargs):
         return self.submit_id(None, f, *args, **kwargs)
 
     def submit_id(self, key, f, *args, **kwargs):
@@ -185,28 +174,27 @@ class DistributedThreads(object):
 class DistributedProcess(DistributedThreads):
     def init_worker(self, worker=AsyncProcess):
         # create list of queue
-        self.queue_list = [multiprocessing.JoinableQueue()
-                           for i in range(self.max_workers)]
+        self.queue_list = [multiprocessing.JoinableQueue() for _ in range(self.max_workers)]
 
         # create list of watching queue
         self.watching_list = [deque() for i in range(self.max_workers)]
 
         # create list of threads:
-        self.worker_list = []
+        self.worker_list: List[AsyncProcess] = []
         for i in range(self.max_workers):
             one_worker = worker(
                 self.queue_list[i], out_queue=self.out_queue, name=str(i))
             self.worker_list.append(one_worker)
             one_worker.start()
 
-    def iterate_queue(self, watching: list, key):
+    def iterate_queue(self, watching: deque, key):
         if key is not None:
             watching.append(key)
         if len(watching) > self.max_watching:
             watching.popleft()
 
     def choose_worker(self):
-        return (self.current_id+1) % self.max_workers
+        return (self.current_id + 1) % self.max_workers
 
     def shutdown(self):
         for q in self.queue_list:
@@ -236,7 +224,7 @@ class Worker(threading.Thread):
             # Signals to queue job is done
             self.out_queue.task_done()
 
-
+            
 class AsyncToSync:
     """
     Utility class which turns an awaitable that only works on the thread with
