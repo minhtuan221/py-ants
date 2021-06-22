@@ -1,11 +1,17 @@
 import multiprocessing
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 # Alternatively, you can create an instance of the loop manually, using: uvloop
 import time
+import signal
+import random
 from collections import deque
 from collections.abc import Iterable
+import traceback
 from typing import List, Callable
+
+# https://stackoverflow.com/questions/64917285/difference-in-python-thread-join-between-python-3-7-and-3-8
 
 
 class SyncThread(threading.Thread):
@@ -26,7 +32,7 @@ class SyncThread(threading.Thread):
 
     def run(self):
         while True:
-            # Grabs host from queue
+            # Grabs task from queue
             f, args, kwargs = self.in_queue.get()
 
             # Grabs item and put to input_function
@@ -185,6 +191,7 @@ class DistributedProcess(DistributedThreads):
             one_worker = worker(
                 self.queue_list[i], out_queue=self.out_queue, name=str(i))
             self.worker_list.append(one_worker)
+            one_worker.daemon = True
             one_worker.start()
 
     def iterate_queue(self, watching: deque, key):
@@ -224,3 +231,203 @@ class Worker(threading.Thread):
             # Signals to queue job is done
             self.out_queue.task_done()
 
+
+class Task:
+    
+    def __init__(self, task_id, f, args, kwargs):
+        self.id = task_id
+        self.f = f
+        self.args = args
+        self.kwargs = kwargs
+        self.result = None
+        self.error = None
+        self.is_done = False
+        self.key = None # must set manually
+    
+    def wrap(self, t):
+        self.id = t.id
+        self.f = t.f
+        self.args = t.args
+        self.kwargs = t.kwargs
+        self.result = t.result
+        self.error = t.error
+    
+
+def run_task(t: Task, out_queue):
+    # Grabs item and put to input_function
+    try:
+        t.result = t.f(*t.args, **t.kwargs)
+    except Exception as e:
+        t.error = e
+        # print(e)
+
+    t.is_done = True      
+
+    if out_queue:
+        out_queue.put(t)
+
+
+class TaskProcess(multiprocessing.Process):
+
+    def __init__(self, in_queue, out_queue=None, name=None, refresh_delay=0.001):
+        multiprocessing.Process.__init__(self, name=name)
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+        self.stop_event = multiprocessing.Event()
+        self.refresh_delay = refresh_delay
+        print('process was created')
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        with ThreadPoolExecutor() as executor:
+            while True:
+                # Grabs item from queue
+                t: Task = self.in_queue.get()
+
+                executor.submit(run_task, t, self.out_queue)
+
+                # Signals to queue job is done
+                self.in_queue.task_done()
+                if self.stop_event.is_set():
+                    print('Process %s is stopping' % self.pid)
+                    break
+                time.sleep(self.refresh_delay)
+        print(self.name, 'process is closed')
+
+
+class TaskPool(object):
+    
+    def __init__(self, in_queue=None, out_queue=None, max_workers=None, max_task=1000, worker=None, maxsize=0, delay=0.001):
+        """Task Pool: receive function and args and return task_id => convert to task => put task in the queue to
+        a map of process => receive task done in other side => put task done in a queue
+
+        Choose process: process can be choosed randomly or balance
+        out queue: will be create automaticlly or passed in input, is multiprocessing.Queue() by default
+        task id: any task is manage by task id, task id is an integer number that is unique
+        task error: error when execute task will be save in task object and return back to taskpool
+        process maintainer: a number of process will be maintain by task pool  
+
+        Args:
+            max_workers (int, optional): [description]. Defaults to 4.
+            max_task (int, optional): [description]. Defaults to 100.
+            worker ([type], optional): [description]. Defaults to None.
+            maxsize (int, optional): [description]. Defaults to 0.
+            delay (float, optional): [description]. Defaults to 0.005.
+        """
+        if not in_queue:
+            in_queue = multiprocessing.JoinableQueue()
+        if not out_queue:
+            out_queue = multiprocessing.Queue()
+        if not max_workers:
+            max_workers = multiprocessing.cpu_count()*2    
+        self.in_queue = in_queue    
+        self.out_queue = out_queue
+        self.max_workers = max_workers
+        self.max_task = max_task
+        self.current_id = 0
+        self.max_qsize = maxsize
+        self.delay = delay
+        self.worker_list = []
+        self.map_task = dict()
+        self.waiting_task = set()
+        self.is_alive = True
+        if worker is None:
+            self.init_worker()
+        else:
+            self.init_worker(worker=worker)
+        
+    def init_worker(self, worker=TaskProcess):
+        # create list of threads:
+        self.worker_list: List[TaskProcess] = []
+        for i in range(self.max_workers):
+            one_worker = worker(self.in_queue, out_queue=self.out_queue, name=str(i), refresh_delay=self.delay)
+            self.worker_list.append(one_worker)
+            one_worker.daemon = True
+            one_worker.start()
+    
+    def choose_worker(self)->TaskProcess:
+        return random.choice(self.worker_list)
+    
+    def gen_task_id(self):
+        self.current_id += 1
+        return self.current_id
+
+    def __submit(self, f, args, kwargs):
+        t = Task(self.gen_task_id(), f, args, kwargs)
+        self.in_queue.put(t)
+        self.waiting_task.add(t.id)
+        self.map_task[t.id] = t
+        return t
+    
+    def submit(self, f: Callable, *args, **kwargs)-> Task:
+        try:
+            if self.is_alive == False:
+                raise Exception('TaskPool is already closed')
+            return self.__submit(f, args, kwargs)
+        except Exception as e:
+            print('start closing all child process')
+            traceback.print_exc()
+            self.force_shutdown()
+    
+    def consume_result(self):
+        while True:
+            if len(self.waiting_task)==0:
+                # print('waiting_task is empty')
+                break
+            time.sleep(self.delay)
+            t_done: Task = self.out_queue.get()
+            if t_done.id in self.waiting_task:
+                self.map_task[t_done.id].wrap(t_done)
+                self.waiting_task.remove(t_done.id)
+            else:
+                raise ValueError('task id of result not in map of task')
+        return 
+    
+    def get_result(self, task_id):
+        if task_id in self.map_task:
+            t: Task = self.map_task[task_id]
+            if t.error:
+                raise t.error
+            return t.result
+        raise ValueError('task id not in map of task')
+
+    def force_shutdown(self):
+        self.is_alive = False
+        self.in_queue.cancel_join_thread()
+        # self.in_queue.close()
+        self.out_queue.close()
+        for process in self.worker_list:
+            print('Force Process %s is stopping' % process.pid)
+            process.terminate()
+
+    def shutdown(self):
+        try:
+            self.in_queue.join()
+            self.consume_result()        
+            self.is_alive = False    
+            for process in self.worker_list:
+                print('Distributed Process %s is stopping' % process.pid)
+                process.terminate()
+        except:
+            traceback.print_exc()
+            self.force_shutdown()
+            return
+
+def say_after(delay, what):
+    time.sleep(0.1)
+    print(what)
+
+def test():
+    pool = TaskPool(max_workers=2)
+    for i in range(1000):
+        try:
+            t = pool.submit(say_after, random.randint(1,5)/5, 'task '+str(i))
+        except:
+            traceback.print_exc()
+            break
+    pool.shutdown()
+
+if __name__ == "__main__":
+    test()
