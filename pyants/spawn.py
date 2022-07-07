@@ -1,3 +1,4 @@
+from ast import Try
 import multiprocessing
 import queue
 import signal
@@ -70,44 +71,38 @@ class SyncThread(threading.Thread):
 
 class AsyncProcess(multiprocessing.Process):
 
-    def __init__(self, in_queue, out_queue, name=None, watching: deque = None):
+    def __init__(self, in_queue, out_queue, stop_event: multiprocessing.Event, name=None, watching: deque = None):
         multiprocessing.Process.__init__(self, name=name)
-        self.in_queue = in_queue
+        self.in_queue: multiprocessing.Queue = in_queue
         self.out_queue = out_queue
-        self.stop_event = multiprocessing.Event()
+        self.stop_event = stop_event
         self.watching = watching
-
-    def stop(self):
+    
+    def stop(self, *args):
         self.stop_event.set()
 
     def run(self):
-        while not self.stop_event.is_set():
-            try:
-                # Grabs item from queue
-                f, args, kwargs = self.in_queue.get()
+        # signal.signal(signal.SIGINT, signal.SIG_IGN)
+        while True:
+            # Grabs item from queue
+            f, args, kwargs = self.in_queue.get()
 
-                # Grabs item and put to input_function
-                result = f(*args, **kwargs)
+            # Grabs item and put to input_function
+            result = f(*args, **kwargs)
 
-                if self.out_queue and result:
-                    if isinstance(result, Iterable):
-                        self.out_queue.put(*result)
-                    else:
-                        self.out_queue.put(*[result])
+            if self.out_queue and result:
+                if isinstance(result, Iterable):
+                    self.out_queue.put(*result)
+                else:
+                    self.out_queue.put(*[result])
 
-                if self.watching and len(self.watching) > 0:
-                    self.watching.popleft()
+            if self.watching and len(self.watching) > 0:
+                self.watching.popleft()
 
-                # Signals to queue job is done
-                # self.in_queue.task_done()
-                if self.stop_event.is_set():
-                    print('Process %s is stopping' % self.pid)
-                    break
-
-            except Exception as e:
-                traceback.print_exc()
-                # self.stop()
-                # break
+            # Signals to queue job is done
+            self.in_queue.task_done()
+            if self.stop_event.is_set():
+                break
 
 
 class DistributedThreads(object):
@@ -173,8 +168,6 @@ class DistributedThreads(object):
         if key is not None:
             for i in range(self.max_workers):
                 if key in self.watching_list[i]:
-                    if worker_id is not None:
-                        raise ValueError("Key belong to more than one worker")
                     worker_id = i
                     self.current_id = worker_id
                     break
@@ -204,10 +197,10 @@ class DistributedThreads(object):
 
 
 class DistributedProcess(DistributedThreads):
+
     def init_worker(self, worker=AsyncProcess):
-        # original_sigint_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
         # create list of queue
-        self.queue_list = [multiprocessing.Queue() for _ in range(self.max_workers)]
+        self.queue_list = [multiprocessing.JoinableQueue() for _ in range(self.max_workers)]
 
         # create list of watching queue
         self.watching_list = [deque() for _ in range(self.max_workers)]
@@ -215,13 +208,11 @@ class DistributedProcess(DistributedThreads):
         # create list of threads:
         self.worker_list: List[AsyncProcess] = []
         for i in range(self.max_workers):
-            one_worker = worker(
-                self.queue_list[i], out_queue=self.out_queue, name=str(i))
+            one_worker = AsyncProcess(
+                self.queue_list[i], out_queue=self.out_queue, stop_event=multiprocessing.Event(), name=str(i))
             self.worker_list.append(one_worker)
             one_worker.daemon = True
             one_worker.start()
-
-        # signal.signal(signal.SIGINT, original_sigint_handler)
 
     def iterate_queue(self, watching: deque, key):
         if key is not None:
@@ -236,14 +227,12 @@ class DistributedProcess(DistributedThreads):
         try:
             for q in self.queue_list:
                 q.join()
-            for process in self.worker_list:
-                print('Distributed Process %s is stopping' % process.pid)
-                process.stop()
-        except:
+        except Exception as e:
             traceback.print_exc()
             for process in self.worker_list:
                 print('Distributed Process %s is forced to stop' % process.pid)
                 process.terminate()
+                process.join()
 
 
 class Worker(threading.Thread):
@@ -294,7 +283,7 @@ def run_task(t: Task, out_queue):
         t.result = t.f(*t.args, **t.kwargs)
     except Exception as e:
         t.error = e
-        # print(e)
+        print(e)
 
     t.is_done = True
 
@@ -310,7 +299,6 @@ class TaskProcess(multiprocessing.Process):
         self.out_queue = out_queue
         self.stop_event = multiprocessing.Event()
         self.refresh_delay = refresh_delay
-        print('process was created')
 
     def stop(self):
         self.stop_event.set()
@@ -453,6 +441,7 @@ class TaskPool(object):
 def say_after(delay, what):
     time.sleep(delay)
     print(os.getpid(), what)
+    # raise ValueError('test raise error')
 
 
 def test():
@@ -467,27 +456,36 @@ def test():
 
 
 @timeit
-def test_distributed_process():
+def test_distributed_process_with_shutdown():
     pool = DistributedProcess(max_workers=8)
-    try:
-        for i in range(1000):
-            pool.submit_id(i % 2**1, say_after, random.randint(1, 10) / 100, 'task ' + str(i))
+    for i in range(500):
+        pool.submit_id(i % 2**1, say_after, random.randint(1, 10) / 100, 'task ' + str(i))
+    pool.shutdown()
+    print('after shutdown')
+    time.sleep(3)
+    # raise KeyboardInterrupt()
 
-        print('end of submit')
-        time.sleep(5)
-        # pool.shutdown()
-    except:
-        traceback.print_exc()
-        pass
-    # pool.shutdown()
+
+@timeit
+def test_distributed_process_without_shutdown():
+    pool = DistributedProcess(max_workers=8)
+    for i in range(1200):
+        pool.submit_id(i % 2**8, say_after, random.randint(1, 10) / 100, 'task ' + str(i))
+    time.sleep(3)
+    raise KeyboardInterrupt()
+    print('timeout')
 
 
 @timeit
 def test_distributed_process_context():
     with DistributedProcess(max_workers=2) as pool:
-        for i in range(1000):
+        for i in range(200):
             pool.submit_id(i % 2**1, say_after, random.randint(1, 10) / 100, 'task ' + str(i))
 
 
 if __name__ == "__main__":
-    test_distributed_process()
+    # các case push vào dưới 100 phần tử/joinableQueue thì ok
+    # test_distributed_process_with_shutdown() 
+    test_distributed_process_without_shutdown()  # will exit when time.sleep done but need try/catch when KeyBroad Interrupt
+    # test_distributed_process_context()
+
