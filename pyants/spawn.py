@@ -310,7 +310,7 @@ class DistributedProcess(object):
             try:
                 worker.put((f, args, kwargs))
                 break
-            except queue.Empty:
+            except queue.Full:
                 time.sleep(0.01)
                 continue
 
