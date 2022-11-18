@@ -73,3 +73,8 @@ A readers–writer (RW) or shared-exclusive lock (also known as a multiple reade
 Read-copy-update (RCU) is a synchronization mechanism based on mutual exclusion. It is used when performance of reads is crucial and is an example of space–time tradeoff, enabling fast operations at the cost of more space.
 
 Read-copy-update allows multiple threads to efficiently read from shared memory by deferring updates after pre-existing reads to a later time while simultaneously marking the data, ensuring new readers will read the updated data. This makes all readers proceed as if there were no synchronization involved, hence they will be fast, but also making updates more difficult.
+
+### Referrence:
+
+python 3 - GIL: https://cloudsek.com/how-do-you-achieve-concurrency-with-python-threads/
+mutiple threading in Java: https://www.digitalocean.com/community/tutorials/multithreading-in-java
