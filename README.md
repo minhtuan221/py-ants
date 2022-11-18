@@ -80,4 +80,6 @@ Read-copy-update allows multiple threads to efficiently read from shared memory 
 
 - python 3 - GIL: https://tenthousandmeters.com/blog/python-behind-the-scenes-13-the-gil-and-its-effects-on-python-multithreading/
 
+- python 3 - GIL, convoy effect: https://github.com/python/cpython/issues/52194
+
 - mutiple threading in Java: https://www.digitalocean.com/community/tutorials/multithreading-in-java
