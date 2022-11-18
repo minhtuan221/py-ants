@@ -76,5 +76,6 @@ Read-copy-update allows multiple threads to efficiently read from shared memory 
 
 ### Referrence:
 
-python 3 - GIL: https://cloudsek.com/how-do-you-achieve-concurrency-with-python-threads/
-mutiple threading in Java: https://www.digitalocean.com/community/tutorials/multithreading-in-java
+- python 3 - GIL: https://cloudsek.com/how-do-you-achieve-concurrency-with-python-threads/
+
+- mutiple threading in Java: https://www.digitalocean.com/community/tutorials/multithreading-in-java
