@@ -1,4 +1,4 @@
-from ast import Try
+import uuid
 import multiprocessing
 import queue
 import signal
@@ -50,40 +50,39 @@ class SyncThread(threading.Thread):
     def run(self):
         while True:
             # Grabs task from queue
-            f, args, kwargs = self.in_queue.get()
+            try:
+                f, args, kwargs = self.in_queue.get()
+            except queue.Empty:
+                time.sleep(0.001)
+                continue
 
             # Grabs item and put to input_function
-            result = f(*args, **kwargs)
+            try:
+                result = (f(*args, **kwargs), None)
+            except Exception as e:
+                result = (None, e)
 
             if self.out_queue and result:
-                if isinstance(result, Iterable):
-                    self.out_queue.put(*result)
-                else:
-                    self.out_queue.put(*[result])
-
-            if self.watching and len(self.watching) > 0:
-                self.watching.popleft()
-                # print('Watching list is:', self.watching)
+                self.out_queue.put(result)
 
             # Signals to queue job is done
             self.in_queue.task_done()
-            # print('Thread complete task', self.getName())
 
 
 class AsyncProcess(multiprocessing.Process):
 
-    def __init__(self, in_queue, out_queue, stop_event: multiprocessing.Event, name=None, watching: deque = None):
+    def __init__(self, in_queue, out_queue, stop_event: multiprocessing.Event, name=None):
         multiprocessing.Process.__init__(self, name=name)
         self.in_queue: multiprocessing.Queue = in_queue
         self.out_queue = out_queue
         self.stop_event = stop_event
-        self.watching = watching
-    
+
     def stop(self, *args):
         self.stop_event.set()
+        print('Child process is stopping')
 
     def run(self):
-        # signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, self.stop)
         while True:
             # Grabs item from queue
             f, args, kwargs = self.in_queue.get()
@@ -95,13 +94,7 @@ class AsyncProcess(multiprocessing.Process):
                 result = e
 
             if self.out_queue and result:
-                if isinstance(result, Iterable):
-                    self.out_queue.put(*result)
-                else:
-                    self.out_queue.put(*[result])
-
-            if self.watching and len(self.watching) > 0:
-                self.watching.popleft()
+                self.out_queue.put(result)
 
             # Signals to queue job is done
             self.in_queue.task_done()
@@ -111,90 +104,64 @@ class AsyncProcess(multiprocessing.Process):
 
 class DistributedThreads(object):
 
-    def __init__(self, out_queue=None, max_workers=4, max_watching=2**16, worker=None, maxsize=100, delay=0.005):
+    def __init__(self, out_queue=None, max_workers=4, worker=None, maxsize=1000, delay=0.005):
         self.out_queue = out_queue
         self.max_workers = max_workers
-        self.max_watching = max_watching
         self.current_id = 0
         self.max_qsize = maxsize
         self.delay = delay
         self.queue_list = []
-        self.watching_list = []
         self.worker_list = []
         if worker is None:
             self.init_worker()
         else:
             self.init_worker(worker=worker)
 
-    def init_worker(self, worker=SyncThread):
+    def init_worker(self):
         # create list of queue
-        self.queue_list = [queue.Queue(maxsize=self.max_qsize) for _ in range(self.max_workers)]
-
-        # create list of watching queue
-        self.watching_list = [deque() for _ in range(self.max_workers)]
+        self.queue_list = [queue.Queue(maxsize=self.max_qsize)
+                           for _ in range(self.max_workers)]
 
         # create list of threads:
         self.worker_list = []
         for i in range(self.max_workers):
-            one_worker = worker(
-                self.queue_list[i], out_queue=self.out_queue, name=str(i), watching=self.watching_list[i])
+            one_worker = SyncThread(
+                self.queue_list[i],
+                out_queue=self.out_queue,
+                name=str(i),
+            )
             one_worker.daemon = True
             self.worker_list.append(one_worker)
             one_worker.start()
 
-    def iterate_queue(self, watching: list, key):
-        if key is not None:
-            watching.append(key)
-        if len(watching) > self.max_watching:
-            time.sleep(self.delay)
-
-    def next_worker(self, last_id):
-        return (last_id + 1) % self.max_workers
-
-    def check_next_queue(self, current_queue_size, last_id):
-        next_id = self.next_worker(last_id)
-        if current_queue_size >= self.queue_list[next_id].qsize():
-            return next_id
+    def hash_to_choose_worker(self, key) -> int:
+        if key is None:
+            k = random.randint(0, self.max_workers - 1)
         else:
-            return self.check_next_queue(current_queue_size, next_id)
-
-    def choose_worker(self):
-        current_queue_size = self.queue_list[self.current_id].qsize()
-        return self.check_next_queue(current_queue_size, self.current_id)
-        # return (self.current_id+1) % self.max_workers
+            try:
+                k = hash(key) % self.max_workers
+            except TypeError:
+                k = random.randint(0, self.max_workers - 1)
+        return k
 
     def submit(self, f: Callable, *args, **kwargs):
         return self.submit_id(None, f, *args, **kwargs)
 
-    def submit_id(self, key: int, f: Callable, *args, **kwargs):
-        worker_id = None
-        # check if key belong to any worker
-        if key is not None:
-            for i in range(self.max_workers):
-                if key in self.watching_list[i]:
-                    worker_id = i
-                    self.current_id = worker_id
-                    break
-
-        if worker_id is None:
-            # choosing a work_id if key is None
-            worker_id = self.choose_worker()
-            self.current_id = worker_id
+    def submit_id(self, key: Union[int, str, float, None], f: Callable, *args, **kwargs):
+        # hash the key
+        worker_id = self.hash_to_choose_worker(key)
 
         # assign to worker and watching list
         worker = self.queue_list[worker_id]
-        watching = self.watching_list[worker_id]
 
-        # add key to a watching
-        self.iterate_queue(watching, key)
-        # print(key, 'choose queue =>', worker_id)
         # add function to queue
         while True:
+            # this will block until it can put function into queue
             try:
                 worker.put((f, args, kwargs))
                 break
-            except queue.Empty:
-                time.sleep(0.01)
+            except queue.Full:
+                time.sleep(self.delay)
                 continue
 
     def shutdown(self):
@@ -210,16 +177,17 @@ class DistributedThreads(object):
 
 class RebalanceDistributedProcess(DistributedThreads):
 
-    def init_worker(self, worker=AsyncProcess):
+    def init_worker(self):
         # create list of queue
-        self.queue_list = [multiprocessing.JoinableQueue(self.max_qsize) for _ in range(self.max_workers)]
+        self.queue_list = [multiprocessing.JoinableQueue(
+            self.max_qsize) for _ in range(self.max_workers)]
 
         # create list of watching queue
         self.watching_list = [deque() for _ in range(self.max_workers)]
 
         # create list of threads:
         self.worker_list: List[AsyncProcess] = []
-        stop_event=multiprocessing.Event()
+        stop_event = multiprocessing.Event()
         for i in range(self.max_workers):
             one_worker = AsyncProcess(
                 self.queue_list[i], out_queue=self.out_queue, stop_event=stop_event, name=str(i))
@@ -265,23 +233,24 @@ class DistributedProcess(object):
         else:
             self.init_worker(worker=worker)
 
-    def init_worker(self, worker=AsyncProcess):
+    def init_worker(self):
         # create list of queue
-        self.queue_list = [multiprocessing.JoinableQueue(self.max_qsize) for _ in range(self.max_workers)]
+        self.queue_list = [multiprocessing.JoinableQueue(
+            self.max_qsize) for _ in range(self.max_workers)]
 
         # create list of watching queue
         self.watching_list = [deque() for _ in range(self.max_workers)]
 
         # create list of threads:
         self.worker_list: List[AsyncProcess] = []
-        stop_event=multiprocessing.Event()
+        stop_event = multiprocessing.Event()
         for i in range(self.max_workers):
             one_worker = AsyncProcess(
                 self.queue_list[i], out_queue=self.out_queue, stop_event=stop_event, name=str(i))
             self.worker_list.append(one_worker)
             one_worker.daemon = True
             one_worker.start()
-        
+
     def hash_to_choose_worker(self, key) -> int:
         if key is None:
             k = random.randint(0, self.max_workers-1)
@@ -291,7 +260,7 @@ class DistributedProcess(object):
             except TypeError:
                 k = random.randint(0, self.max_workers-1)
         return k
-    
+
     def submit(self, f: Callable, *args, **kwargs):
         return self.submit_id(None, f, *args, **kwargs)
 
@@ -302,7 +271,6 @@ class DistributedProcess(object):
         # assign to worker and watching list
         worker = self.queue_list[worker_id]
         # no need watching list
-        # print(key, 'choose queue =>', worker_id)
 
         # add function to queue
         while True:
@@ -332,27 +300,6 @@ class DistributedProcess(object):
                 process.join()
 
 
-class Worker(threading.Thread):
-    """Threaded title parser"""
-
-    def __init__(self, out_queue, f):
-        threading.Thread.__init__(self)
-        self.out_queue = out_queue
-        self.f = f
-
-    def run(self):
-        while True:
-            # Grabs chunk from queue
-            args = self.out_queue.get(), None
-
-            # Parse the chunk
-            args = args[:-1]
-            self.f(*args)
-
-            # Signals to queue job is done
-            self.out_queue.task_done()
-
-
 class Task:
 
     def __init__(self, task_id, f, args, kwargs):
@@ -379,7 +326,6 @@ def run_task(t: Task, out_queue):
         t.result = t.f(*t.args, **t.kwargs)
     except Exception as e:
         t.error = e
-        print(e)
 
     t.is_done = True
 
@@ -396,10 +342,11 @@ class TaskProcess(multiprocessing.Process):
         self.stop_event = multiprocessing.Event()
         self.refresh_delay = refresh_delay
 
-    def stop(self):
+    def stop(self, *args):
         self.stop_event.set()
 
     def run(self):
+        signal.signal(signal.SIGINT, self.stop)
         with ThreadPoolExecutor() as executor:
             while True:
                 # Grabs item from queue
@@ -460,7 +407,8 @@ class TaskPool(object):
         # create list of threads:
         self.worker_list: List[TaskProcess] = []
         for i in range(self.max_workers):
-            one_worker = worker(self.in_queue, out_queue=self.out_queue, name=str(i), refresh_delay=self.delay)
+            one_worker = worker(self.in_queue, out_queue=self.out_queue, name=str(
+                i), refresh_delay=self.delay)
             self.worker_list.append(one_worker)
             one_worker.daemon = True
             one_worker.start()
@@ -469,8 +417,7 @@ class TaskPool(object):
         return random.choice(self.worker_list)
 
     def gen_task_id(self):
-        self.current_id += 1
-        return self.current_id
+        return uuid.uuid1()
 
     def __submit(self, f, args, kwargs, id=None):
         if id is None:
@@ -504,7 +451,6 @@ class TaskPool(object):
     def consume_result(self):
         while True:
             if len(self.waiting_task) == 0:
-                # print('waiting_task is empty')
                 break
             time.sleep(self.delay)
             q_size = self.out_queue.qsize()
@@ -550,7 +496,7 @@ class TaskPool(object):
 
 def say_after(delay, what):
     time.sleep(delay)
-    print(os.getpid(), what)
+    # print(os.getpid(), what)
     # raise ValueError('test raise error')
 
 
@@ -564,7 +510,18 @@ def test_one_process():
 def test_task_pool(w=2):
     pool = TaskPool(max_workers=w)
     for i in range(1000):
-        pool.submit_id(None, say_after, random.randint(1, 20) / 1000, 'task ' + str(i))
+        pool.submit_id(None, say_after, random.randint(
+            1, 20) / 1000, 'task ' + str(i))
+    pool.shutdown()
+    print('worker =', w)
+
+
+@timeit
+def test_distributed_thread_with_shutdown(w=2):
+    pool = DistributedThreads(max_workers=w)
+    for i in range(1000):
+        pool.submit_id(i % 2**8, say_after,
+                       random.randint(1, 20) / 1000, 'task ' + str(i))
     pool.shutdown()
     print('worker =', w)
 
@@ -573,7 +530,8 @@ def test_task_pool(w=2):
 def test_distributed_process_with_shutdown(w=2):
     pool = DistributedProcess(max_workers=w)
     for i in range(1000):
-        pool.submit_id(i % 2**8, say_after, random.randint(1, 20) / 1000, 'task ' + str(i))
+        pool.submit_id(i % 2**8, say_after,
+                       random.randint(1, 20) / 1000, 'task ' + str(i))
     pool.shutdown()
     print('worker =', w)
 
@@ -582,7 +540,8 @@ def test_distributed_process_with_shutdown(w=2):
 def test_rebalance_distributed_process_with_shutdown(w=2):
     pool = RebalanceDistributedProcess(max_workers=w)
     for i in range(1000):
-        pool.submit_id(i % 2**8, say_after, random.randint(1, 20) / 1000, 'task ' + str(i))
+        pool.submit_id(i % 2**8, say_after,
+                       random.randint(1, 20) / 1000, 'task ' + str(i))
     pool.shutdown()
     print('worker =', w)
 
@@ -601,33 +560,50 @@ def test_distributed_process_without_shutdown(w=2):
 def test_distributed_process_context():
     with DistributedProcess(max_workers=2) as pool:
         for i in range(200):
-            pool.submit_id(i % 2**1, say_after, random.randint(1, 20) / 1000, 'task ' + str(i))
+            pool.submit_id(i % 2**1, say_after,
+                           random.randint(1, 20) / 1000, 'task ' + str(i))
 
 
 if __name__ == "__main__":
-    # các case push vào dưới 100 phần tử/joinableQueue thì ok, lớn hơn sẽ gây ra lỗi không thoát dc process
+    # các case push vào dưới 100 phần tử/joinableQueue thì ok, 
+    # lớn hơn sẽ gây ra lỗi không thoát dc process
+    # ----------------------- hashing key pool Thread ---------------------------
+    test_distributed_thread_with_shutdown(2)
+    test_distributed_thread_with_shutdown(4)
+    test_distributed_thread_with_shutdown(8)
+    test_distributed_thread_with_shutdown(16)
 
-    # ----------------------- hashing key pool worker --------------------------- 
+    # ----------------------- hashing key pool worker ---------------------------
     # test with random time to complete (random sleep time)
-    test_distributed_process_with_shutdown(1) # 'test_distributed_process_with_shutdown'  20362.6773 ms
-    test_distributed_process_with_shutdown(2) # 'test_distributed_process_with_shutdown'  10235.3477 ms
-    test_distributed_process_with_shutdown(4) # 'test_distributed_process_with_shutdown'  5442.7423 ms
-    test_distributed_process_with_shutdown(8) # 'test_distributed_process_with_shutdown'  2921.3138 ms
-    test_distributed_process_with_shutdown(16) # 'test_distributed_process_with_shutdown'  1958.2040 ms
+    # 'test_distributed_process_with_shutdown'  20362.6773 ms
+    test_distributed_process_with_shutdown(1)
+    # 'test_distributed_process_with_shutdown'  10235.3477 ms
+    test_distributed_process_with_shutdown(2)
+    # 'test_distributed_process_with_shutdown'  5442.7423 ms
+    test_distributed_process_with_shutdown(4)
+    # 'test_distributed_process_with_shutdown'  2921.3138 ms
+    test_distributed_process_with_shutdown(8)
+    # 'test_distributed_process_with_shutdown'  1958.2040 ms
+    test_distributed_process_with_shutdown(16)
 
-    # ----------------------- rebalance key pool worker --------------------------- 
+    # ----------------------- rebalance key pool worker ---------------------------
     # test with random time to complete (random sleep time)
-    test_rebalance_distributed_process_with_shutdown(1) # 'test_rebalance_distributed_process_with_shutdown'  19833.1923 ms
-    test_rebalance_distributed_process_with_shutdown(2) # 'test_rebalance_distributed_process_with_shutdown'  10114.3961 ms
-    test_rebalance_distributed_process_with_shutdown(4) # 'test_rebalance_distributed_process_with_shutdown'  5311.5776 ms
-    test_rebalance_distributed_process_with_shutdown(8) # 'test_rebalance_distributed_process_with_shutdown'  3022.2836 ms
-    test_rebalance_distributed_process_with_shutdown(16) # 'test_rebalance_distributed_process_with_shutdown'  1926.1019 ms
+    # 'test_rebalance_distributed_process_with_shutdown'  19833.1923 ms
+    test_rebalance_distributed_process_with_shutdown(1)
+    # 'test_rebalance_distributed_process_with_shutdown'  10114.3961 ms
+    test_rebalance_distributed_process_with_shutdown(2)
+    # 'test_rebalance_distributed_process_with_shutdown'  5311.5776 ms
+    test_rebalance_distributed_process_with_shutdown(4)
+    # 'test_rebalance_distributed_process_with_shutdown'  3022.2836 ms
+    test_rebalance_distributed_process_with_shutdown(8)
+    # 'test_rebalance_distributed_process_with_shutdown'  1926.1019 ms
+    test_rebalance_distributed_process_with_shutdown(16)
 
-    # ----------------------- test task pool---------------------------
-    # test with random time to complete (random sleep time)
-    test_one_process()  # 'test_one_process'  19961.0634 ms
-    test_task_pool(1) # 1 worker : 'test_task_pool'  16203.1040 ms
-    test_task_pool(2) # 2 worker : 'test_task_pool'  8178.5283 ms
-    test_task_pool(4) # 4 worker : 'test_task_pool'  4228.0197 ms
-    test_task_pool(8) # 8 worker : 'test_task_pool'  2581.5420 ms
-    test_task_pool(16) # 16 worker : 'test_task_pool'  1604.7373 ms
+    # # ----------------------- test task pool---------------------------
+    # # test with random time to complete (random sleep time)
+    # test_one_process()  # 'test_one_process'  19961.0634 ms
+    test_task_pool(1)  # 1 worker : 'test_task_pool'  16203.1040 ms
+    test_task_pool(2)  # 2 worker : 'test_task_pool'  8178.5283 ms
+    test_task_pool(4)  # 4 worker : 'test_task_pool'  4228.0197 ms
+    test_task_pool(8)  # 8 worker : 'test_task_pool'  2581.5420 ms
+    test_task_pool(16)  # 16 worker : 'test_task_pool'  1604.7373 ms
